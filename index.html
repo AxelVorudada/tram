@@ -74,7 +74,7 @@
     <div class="big" id="arms">0.00</div>
   </div>
   <div style="text-align:right">
-    <div class="lbl">Пик</div>
+    <div class="lbl">Пик за 1 с</div>
     <div class="big" id="apk" style="font-size:20px">0.00</div>
   </div>
 </div>
@@ -99,15 +99,20 @@
     <summary>Пороги зон (м/с², СКЗ за 1 с) и настройки</summary>
     <div class="thr" style="margin-top:6px">
       <span><i class="sw" style="background:var(--ok)"></i>зелёный до</span>
-      <input type="range" id="t1" min="0.1" max="1.5" step="0.05" value="0.30"><output id="t1v">0.30</output>
+      <input type="range" id="t1" min="0.1" max="3" step="0.05" value="0.30"><output id="t1v">0.30</output>
       <span><i class="sw" style="background:var(--warn)"></i>жёлтый до</span>
-      <input type="range" id="t2" min="0.1" max="2.5" step="0.05" value="0.40"><output id="t2v">0.40</output>
+      <input type="range" id="t2" min="0.1" max="5" step="0.05" value="0.40"><output id="t2v">0.40</output>
       <span><i class="sw" style="background:var(--bad)"></i>красный выше</span><span></span><output id="t3v">0.40</output>
+      <span>Оценка по</span>
+      <select id="mode" style="font:inherit;padding:6px;border-radius:6px;background:#20252b;color:var(--fg);border:1px solid var(--line)">
+        <option value="rms">СКЗ за 1 с</option><option value="peak">пику за 1 с</option></select><span></span>
+      <span>Фильтр НЧ, Гц</span>
+      <input type="range" id="fc" min="0.5" max="10" step="0.5" value="2"><output id="fcv">2.0</output>
     </div>
     <p style="color:var(--muted);margin:8px 0 0">
       Значения по умолчанию взяты из предварительной шкалы непрерывного комфорта EN 12299
       (C<sub>Cy</sub> &lt;0,2 очень комфортно, 0,2–0,3 комфортно, 0,3–0,4 средне, &gt;0,4 менее комфортно).
-      Здесь без частотного взвешивания, поэтому показания завышены относительно нормы.
+      Сигнал пропускается через фильтр нижних частот (две ступени первого порядка), чтобы отбросить вибрацию, которую нормы не учитывают, но это упрощение, а не взвешивание W<sub>d</sub> по ISO 2631-1. Тряска телефона рукой даёт 2–5 м/с² и всегда «красная».
       Боковая ось = ось X телефона. Автор: Ададуров А.С.
     </p>
   </details>
@@ -153,6 +158,10 @@
     redraw();
   }
   $('t1').oninput = $('t2').oninput = readThr;
+  let mode = 'rms';
+  $('mode').onchange = () => { mode = $('mode').value; redraw(); };
+  $('fc').oninput = () => { $('fcv').value = (+$('fc').value).toFixed(1); };
+  const val = r => mode === 'peak' ? r.peak : r.rms;
   const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   function zone(a){ return a < thr.t1 ? 0 : a < thr.t2 ? 1 : 2; }
   function color(a){ return [css('--ok'), css('--warn'), css('--bad')][zone(a)]; }
@@ -162,6 +171,7 @@
   // event.acceleration — ускорение без силы тяжести (вычислена ОС по датчикам).
   const buf = [];          // {t, ax}
   let peak = 0, nEv = 0, hzT0 = 0;
+  let f1 = 0, f2 = 0, tPrev = 0; // состояние ФНЧ
   let gx = null; // медленная (гравитационная) составляющая по X для запасного режима
   function onMotion(e){
     let x;
@@ -174,14 +184,20 @@
       x = raw - gx;
     } else return;
     const t = performance.now();
+    // ФНЧ: две ступени первого порядка, alpha = dt/(RC+dt), RC = 1/(2*pi*fc)
+    if (tPrev){
+      const dt = Math.min((t - tPrev)/1000, 0.1), RC = 1/(2*Math.PI*(+$('fc').value)), al = dt/(RC+dt);
+      f1 += al*(x - f1); f2 += al*(f1 - f2); x = f2;
+    } else { f1 = f2 = x; }
+    tPrev = t;
     buf.push({t, ax:x});
     while (buf.length && t - buf[0].t > 1000) buf.shift();
-    const ax = Math.abs(x);
-    if (ax > peak) peak = ax;
+
     nEv++;
     if (!hzT0) hzT0 = t;
     if (t - hzT0 >= 2000){ $('hz').textContent = (nEv / ((t - hzT0)/1000)).toFixed(0); nEv = 0; hzT0 = t; }
   }
+  function peak1s(){ let m=0; for (const b of buf) if (Math.abs(b.ax)>m) m=Math.abs(b.ax); return m; }
   function rms1s(){
     if (!buf.length) return 0;
     let s = 0; for (const b of buf) s += b.ax*b.ax;
@@ -195,11 +211,10 @@
     const c = p.coords;
     const rms = rms1s();
     const rec = {time:new Date(p.timestamp).toISOString(), lat:c.latitude, lon:c.longitude,
-                 acc:c.accuracy, speed:c.speed, rms, peak};
-    peak = 0; // пик между фиксами
+                 acc:c.accuracy, speed:c.speed, rms, peak:peak1s()};
     if (lastFix){
       L.polyline([[lastFix.lat,lastFix.lon],[c.latitude,c.longitude]],
-                 {color:color(rms), weight:7, opacity:.9}).addTo(track).bindPopup(popupText(rec));
+                 {color:color(val(rec)), weight:7, opacity:.9}).addTo(track).bindPopup(popupText(rec));
     }
     points.push(rec);
     lastFix = {lat:c.latitude, lon:c.longitude};
@@ -217,7 +232,7 @@
   function drawTrip(pts, layer, opacity){
     for (let i=1;i<pts.length;i++){
       const a=pts[i-1], b=pts[i];
-      L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:color(b.rms),weight:7,opacity}).addTo(layer).bindPopup(popupText(b));
+      L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:color(val(b)),weight:7,opacity}).addTo(layer).bindPopup(popupText(b));
     }
   }
   function redraw(){
@@ -237,7 +252,7 @@
   function tripStats(pts){
     let d=0, mx=0, n=[0,0,0];
     for (let i=1;i<pts.length;i++){ d += map.distance([pts[i-1].lat,pts[i-1].lon],[pts[i].lat,pts[i].lon]); }
-    for (const r of pts){ if (r.rms>mx) mx=r.rms; n[zone(r.rms)]++; }
+    for (const r of pts){ if (val(r)>mx) mx=val(r); n[zone(val(r))]++; }
     const dur = pts.length>1 ? (Date.parse(pts[pts.length-1].time)-Date.parse(pts[0].time))/60000 : 0;
     return {km:d/1000, min:dur, max:mx, n};
   }
@@ -325,8 +340,8 @@
     uiTimer = setInterval(() => {
       const r = rms1s();
       $('arms').textContent = r.toFixed(2);
-      $('apk').textContent = peak.toFixed(2);
-      $('dot').style.background = buf.length ? color(r) : css('--muted');
+      peak = peak1s(); $('apk').textContent = peak.toFixed(2);
+      $('dot').style.background = buf.length ? color(mode==='peak'?peak:r) : css('--muted');
     }, 200);
     try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
     $('btnStart').disabled = true; $('btnStop').disabled = false;
@@ -351,7 +366,7 @@
   function csv(pts, name){
     const rows = [['time_utc','lat','lon','accuracy_m','speed_mps','lat_acc_rms_1s_mps2','lat_acc_peak_mps2','zone']];
     for (const r of pts) rows.push([r.time, r.lat.toFixed(6), r.lon.toFixed(6), r.acc.toFixed(1),
-      r.speed==null?'':r.speed.toFixed(2), r.rms.toFixed(3), r.peak.toFixed(3), ['green','yellow','red'][zone(r.rms)]]);
+      r.speed==null?'':r.speed.toFixed(2), r.rms.toFixed(3), r.peak.toFixed(3), ['green','yellow','red'][zone(val(r))]]);
     const blob = new Blob(['# Автор: Ададуров А.С.\n' + rows.map(r=>r.join(',')).join('\n')], {type:'text/csv'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
