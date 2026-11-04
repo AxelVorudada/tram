@@ -49,6 +49,17 @@
   details summary{cursor:pointer;color:var(--muted);font-size:12px}
   details{font-size:12px}
   .leaflet-control-attribution{font-size:9px}
+  #hist{top:0;bottom:0;padding-top:calc(10px + env(safe-area-inset-top,0px));padding-bottom:calc(10px + env(safe-area-inset-bottom,0px));
+        overflow-y:auto;z-index:1100;display:flex;flex-direction:column;gap:10px}
+  #hist[hidden]{display:none}
+  .btnlike{font-weight:600;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#20252b;cursor:pointer}
+  .trip{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+  .trip input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
+  .trip .name{font-weight:600}
+  .trip .meta{grid-column:2;font-family:var(--mono);font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .trip .acts{grid-column:2;display:flex;gap:6px;flex-wrap:wrap}
+  .trip .acts button{padding:6px 10px;font-size:12px}
+  .bar{display:inline-block;height:8px;border-radius:2px}
   @media (prefers-reduced-motion:reduce){.dot{transition:none}}
 </style>
 </head>
@@ -81,6 +92,7 @@
     <button id="btnCsv" disabled>CSV</button>
     <button id="btnClear" class="danger">Очистить</button>
     <button id="btnCenter">К себе</button>
+    <button id="btnHist">История <span id="histN"></span></button>
   </div>
   <div id="status">Закрепите телефон в держателе экраном к себе, нажмите «Старт».</div>
   <details>
@@ -99,6 +111,19 @@
       Боковая ось = ось X телефона. Автор: Ададуров А.С.
     </p>
   </details>
+</div>
+
+<!-- Панель истории поездок -->
+<div id="hist" class="panel" hidden>
+  <div class="row" style="justify-content:space-between">
+    <b>История поездок</b>
+    <span class="row">
+      <label class="btnlike">Загрузить CSV<input type="file" id="fileCsv" accept=".csv,text/csv" multiple hidden></label>
+      <button id="btnHistClose">Закрыть</button>
+    </span>
+  </div>
+  <div id="histList"></div>
+  <div id="histEmpty" style="color:var(--muted)">Поездок пока нет. Нажмите «Старт», проедьте, нажмите «Стоп» — поездка сохранится сама.</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -189,30 +214,110 @@
   function popupText(r){
     return `СКЗ ${r.rms.toFixed(2)} м/с², пик ${r.peak.toFixed(2)} м/с²<br>${r.time.slice(11,19)} UTC, ±${r.acc.toFixed(0)} м`;
   }
-  function redraw(){
-    track.clearLayers();
-    for (let i=1;i<points.length;i++){
-      const a=points[i-1], b=points[i];
-      L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:color(b.rms),weight:7,opacity:.9}).addTo(track).bindPopup(popupText(b));
+  function drawTrip(pts, layer, opacity){
+    for (let i=1;i<pts.length;i++){
+      const a=pts[i-1], b=pts[i];
+      L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:color(b.rms),weight:7,opacity}).addTo(layer).bindPopup(popupText(b));
     }
   }
+  function redraw(){
+    track.clearLayers(); drawTrip(points, track, .9);
+    for (const id in shown){ shown[id].clearLayers(); const t = trips.find(t=>t.id===id); if (t) drawTrip(t.pts, shown[id], .75); }
+  }
+
+  // ---------- история поездок (localStorage) ----------
+  const KEY = 'tram_trips_v1';
+  let trips = [];            // {id, name, pts:[...]}
+  const shown = {};          // id -> L.layerGroup для показанных на карте
+  function loadTrips(){ try { trips = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch(e){ trips = []; } }
+  function saveTrips(){
+    try { localStorage.setItem(KEY, JSON.stringify(trips)); return true; }
+    catch(e){ status('Не удалось сохранить: память браузера заполнена. Скачайте CSV и удалите старые поездки.'); return false; }
+  }
+  function tripStats(pts){
+    let d=0, mx=0, n=[0,0,0];
+    for (let i=1;i<pts.length;i++){ d += map.distance([pts[i-1].lat,pts[i-1].lon],[pts[i].lat,pts[i].lon]); }
+    for (const r of pts){ if (r.rms>mx) mx=r.rms; n[zone(r.rms)]++; }
+    const dur = pts.length>1 ? (Date.parse(pts[pts.length-1].time)-Date.parse(pts[0].time))/60000 : 0;
+    return {km:d/1000, min:dur, max:mx, n};
+  }
+  function fmtName(iso){ const d=new Date(iso); return d.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); }
+  function addTrip(pts, name){
+    if (pts.length < 2) return null;
+    const t = {id: Date.now().toString(36)+Math.random().toString(36).slice(2,6), name: name || fmtName(pts[0].time), pts};
+    trips.unshift(t);
+    if (saveTrips()) { renderHist(); return t; }
+    trips.shift(); return null;
+  }
+  function renderHist(){
+    const list = $('histList'); list.innerHTML = '';
+    $('histEmpty').hidden = trips.length > 0;
+    $('histN').textContent = trips.length ? '('+trips.length+')' : '';
+    for (const t of trips){
+      const st = tripStats(t.pts), tot = Math.max(1, st.n[0]+st.n[1]+st.n[2]);
+      const el = document.createElement('div'); el.className = 'trip';
+      el.innerHTML =
+        `<input type="checkbox" id="cb_${t.id}" ${shown[t.id]?'checked':''} aria-label="Показать на карте">
+         <span class="name">${t.name}</span>
+         <span class="meta">${st.km.toFixed(1)} км · ${st.min.toFixed(0)} мин · ${t.pts.length} точек · макс ${st.max.toFixed(2)} м/с²<br>
+           <i class="bar" style="width:${(st.n[0]/tot*100).toFixed(0)}%;background:var(--ok)"></i><i class="bar" style="width:${(st.n[1]/tot*100).toFixed(0)}%;background:var(--warn)"></i><i class="bar" style="width:${(st.n[2]/tot*100).toFixed(0)}%;background:var(--bad)"></i></span>
+         <span class="acts"><button data-a="show">Показать</button><button data-a="rename">Имя</button><button data-a="csv">CSV</button><button data-a="del" class="danger">Удалить</button></span>`;
+      el.querySelector('input').onchange = e => toggleTrip(t.id, e.target.checked);
+      el.querySelector('[data-a=show]').onclick = () => { toggleTrip(t.id, true); $('hist').hidden = true; follow = false;
+        map.fitBounds(L.latLngBounds(t.pts.map(r=>[r.lat,r.lon])), {padding:[30,30]}); };
+      el.querySelector('[data-a=rename]').onclick = () => { const inp = document.createElement('input'); inp.value = t.name; inp.style.font='inherit';
+        el.querySelector('.name').replaceWith(inp); inp.focus();
+        inp.onblur = inp.onchange = () => { t.name = inp.value.trim() || t.name; saveTrips(); renderHist(); }; };
+      el.querySelector('[data-a=csv]').onclick = () => csv(t.pts, t.name);
+      el.querySelector('[data-a=del]').onclick = () => {
+        const b = el.querySelector('[data-a=del]');
+        if (b.dataset.sure){ toggleTrip(t.id,false); trips = trips.filter(x=>x.id!==t.id); saveTrips(); renderHist(); }
+        else { b.dataset.sure = '1'; b.textContent = 'Точно удалить?'; setTimeout(()=>{ delete b.dataset.sure; b.textContent='Удалить'; }, 3000); }
+      };
+      list.appendChild(el);
+    }
+  }
+  function toggleTrip(id, on){
+    if (on && !shown[id]){ const t = trips.find(t=>t.id===id); if (!t) return;
+      shown[id] = L.layerGroup().addTo(map); drawTrip(t.pts, shown[id], .75); }
+    else if (!on && shown[id]){ map.removeLayer(shown[id]); delete shown[id]; }
+    const cb = $('cb_'+id); if (cb) cb.checked = !!shown[id];
+  }
+  $('btnHist').onclick = () => { renderHist(); $('hist').hidden = false; };
+  $('btnHistClose').onclick = () => $('hist').hidden = true;
+
+  // Импорт CSV, записанного этим же приложением
+  $('fileCsv').onchange = async e => {
+    for (const f of e.target.files){
+      const txt = await f.text();
+      const lines = txt.split(/\r?\n/).filter(l => l && !l.startsWith('#'));
+      const head = lines.shift().split(',');
+      const ix = n => head.indexOf(n);
+      if (ix('lat')<0 || ix('lat_acc_rms_1s_mps2')<0){ status('Файл '+f.name+' не похож на CSV этого приложения.'); continue; }
+      const pts = lines.map(l => { const c = l.split(',');
+        return {time:c[ix('time_utc')], lat:+c[ix('lat')], lon:+c[ix('lon')], acc:+c[ix('accuracy_m')],
+                speed:c[ix('speed_mps')]===''?null:+c[ix('speed_mps')], rms:+c[ix('lat_acc_rms_1s_mps2')], peak:+c[ix('lat_acc_peak_mps2')]}; })
+        .filter(r => isFinite(r.lat) && isFinite(r.lon));
+      const t = addTrip(pts, f.name.replace(/\.csv$/i,''));
+      if (t) toggleTrip(t.id, true);
+    }
+    e.target.value = '';
+  };
 
   // ---------- управление ----------
   function status(s){ $('status').textContent = s; }
   async function start(){
     if (!('DeviceMotionEvent' in window)) { status('Браузер не даёт доступ к акселерометру.'); return; }
     if (!navigator.geolocation) { status('Браузер не даёт доступ к геолокации.'); return; }
-    if (!window.isSecureContext) { status('Нужен защищённый контекст (https или локальный файл в Chrome).'); return; }
-    // Запрос разрешения (iOS и некоторые сборки Chrome). Отказ не фатален: пробуем слушать датчик всё равно.
+    if (!window.isSecureContext) { status('Нужен защищённый контекст (https).'); return; }
+    if (points.length) { points.length = 0; lastFix = null; track.clearLayers(); }
     if (typeof DeviceMotionEvent.requestPermission === 'function'){
       try { await DeviceMotionEvent.requestPermission(); } catch(e){}
     }
     window.addEventListener('devicemotion', onMotion);
-    // Контроль: если за 3 с не пришло ни одного события — подсказываем, что включить.
     setTimeout(() => {
       if (watchId !== null && !buf.length)
-        status('Данные с акселерометра не приходят. Chrome → Настройки → Настройки сайтов → Датчики движения → включить. ' +
-               'Если не помогает, откройте файл по https (см. инструкцию).');
+        status('Данные с акселерометра не приходят. Chrome → Настройки → Настройки сайтов → Датчики движения → включить.');
     }, 3000);
     watchId = navigator.geolocation.watchPosition(onFix,
       err => status('Геолокация: ' + err.message),
@@ -233,28 +338,33 @@
     clearInterval(uiTimer); watchId = null;
     if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
     $('btnStart').disabled = false; $('btnStop').disabled = true;
-    status(`Остановлено. Записано точек: ${points.length}.`);
+    const t = addTrip(points.slice());
+    status(t ? `Остановлено. Поездка «${t.name}» сохранена в историю (${points.length} точек).`
+             : `Остановлено. Точек слишком мало для сохранения (${points.length}).`);
   }
   function clearAll(){
     if (watchId !== null) stop();
     points.length = 0; lastFix = null; track.clearLayers(); peak = 0; buf.length = 0;
-    $('npts').textContent = 0; $('btnCsv').disabled = true; status('Очищено.');
+    for (const id in shown) toggleTrip(id, false);
+    $('npts').textContent = 0; $('btnCsv').disabled = true; status('Карта очищена. История сохранена, см. «История».');
   }
-  function csv(){
+  function csv(pts, name){
     const rows = [['time_utc','lat','lon','accuracy_m','speed_mps','lat_acc_rms_1s_mps2','lat_acc_peak_mps2','zone']];
-    for (const r of points) rows.push([r.time, r.lat.toFixed(6), r.lon.toFixed(6), r.acc.toFixed(1),
+    for (const r of pts) rows.push([r.time, r.lat.toFixed(6), r.lon.toFixed(6), r.acc.toFixed(1),
       r.speed==null?'':r.speed.toFixed(2), r.rms.toFixed(3), r.peak.toFixed(3), ['green','yellow','red'][zone(r.rms)]]);
     const blob = new Blob(['# Автор: Ададуров А.С.\n' + rows.map(r=>r.join(',')).join('\n')], {type:'text/csv'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'tram_lateral_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.csv';
+    a.download = 'tram_' + (name || new Date().toISOString().slice(0,16)).replace(/[^\wа-яА-ЯёЁ.-]+/g,'_') + '.csv';
     document.body.appendChild(a); a.click(); a.remove();
   }
-  $('btnStart').onclick = start; $('btnStop').onclick = stop; $('btnClear').onclick = clearAll; $('btnCsv').onclick = csv;
+  $('btnStart').onclick = start; $('btnStop').onclick = stop; $('btnClear').onclick = clearAll;
+  $('btnCsv').onclick = () => csv(points, 'текущая_'+new Date().toISOString().slice(0,16));
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState === 'visible' && watchId !== null && navigator.wakeLock)
       try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
   });
+  loadTrips(); renderHist();
   readThr();
 })();
 </script>
