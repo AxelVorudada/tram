@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Трамвай: поперечные ускорения</title>
+<!--
+  Измеритель поперечных (боковых) ускорений трамвая с привязкой к координатам ГНСС.
+  Автор: Ададуров А.С., 2026-11-04.
+  Библиотека карты: Leaflet 1.9.4 (BSD-2), подложка OpenStreetMap.
+-->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  /* Макет: карта на весь экран, сверху компактная панель показаний, снизу панель управления */
+  :root{
+    --bg:#15181c; --panel:rgba(21,24,28,.92); --fg:#e8ebee; --muted:#9aa3ad; --line:#2c3238;
+    --accent:#4ea1ff;
+    --ok:#2ecc71; --warn:#f1c40f; --bad:#e74c3c;
+    --font:"Roboto","Segoe UI",system-ui,sans-serif;
+    --mono:"Roboto Mono",ui-monospace,Menlo,monospace;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:var(--font);background:var(--bg);color:var(--fg);font-size:14px;overflow:hidden}
+  #map{position:absolute;inset:0;background:#0d0f12}
+  .panel{position:absolute;left:0;right:0;z-index:1000;background:var(--panel);backdrop-filter:blur(6px);
+         padding-left:max(12px,env(safe-area-inset-left,0px));padding-right:max(12px,env(safe-area-inset-right,0px))}
+  #top{top:0;padding-top:calc(8px + env(safe-area-inset-top,0px));padding-bottom:8px;border-bottom:1px solid var(--line);
+       display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center}
+  #bottom{bottom:0;padding-top:8px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line);
+          display:flex;flex-direction:column;gap:8px}
+  .big{font-family:var(--mono);font-size:30px;line-height:1;font-variant-numeric:tabular-nums;font-weight:600}
+  .lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  .dot{width:46px;height:46px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px var(--line);transition:background .2s}
+  .stats{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted)}
+  .stats b{color:var(--fg);font-weight:500}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button{font:inherit;font-weight:600;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#20252b;color:var(--fg);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#0b1e33}
+  button.danger{background:#3a1f1f;border-color:#5a2a2a}
+  button:disabled{opacity:.45;cursor:default}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .thr{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;font-size:12px}
+  .thr input[type=range]{width:100%;accent-color:var(--accent)}
+  .thr output{font-family:var(--mono);min-width:5.5em;text-align:right}
+  .sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-1px}
+  #status{font-size:12px;color:var(--muted);min-height:1.2em}
+  details summary{cursor:pointer;color:var(--muted);font-size:12px}
+  details{font-size:12px}
+  .leaflet-control-attribution{font-size:9px}
+  @media (prefers-reduced-motion:reduce){.dot{transition:none}}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="top" class="panel">
+  <div class="dot" id="dot" aria-label="Текущая зона"></div>
+  <div>
+    <div class="lbl">Поперечное ускорение, СКЗ за 1 с, м/с²</div>
+    <div class="big" id="arms">0.00</div>
+  </div>
+  <div style="text-align:right">
+    <div class="lbl">Пик</div>
+    <div class="big" id="apk" style="font-size:20px">0.00</div>
+  </div>
+</div>
+
+<div id="bottom" class="panel">
+  <div class="stats">
+    <span>Скорость <b id="spd">—</b> км/ч</span>
+    <span>Точность <b id="acc">—</b> м</span>
+    <span>Частота датчика <b id="hz">—</b> Гц</span>
+    <span>Точек <b id="npts">0</b></span>
+  </div>
+  <div class="row">
+    <button id="btnStart" class="primary">Старт</button>
+    <button id="btnStop" disabled>Стоп</button>
+    <button id="btnCsv" disabled>CSV</button>
+    <button id="btnClear" class="danger">Очистить</button>
+    <button id="btnCenter">К себе</button>
+  </div>
+  <div id="status">Закрепите телефон в держателе экраном к себе, нажмите «Старт».</div>
+  <details>
+    <summary>Пороги зон (м/с², СКЗ за 1 с) и настройки</summary>
+    <div class="thr" style="margin-top:6px">
+      <span><i class="sw" style="background:var(--ok)"></i>зелёный до</span>
+      <input type="range" id="t1" min="0.1" max="1.5" step="0.05" value="0.30"><output id="t1v">0.30</output>
+      <span><i class="sw" style="background:var(--warn)"></i>жёлтый до</span>
+      <input type="range" id="t2" min="0.1" max="2.5" step="0.05" value="0.40"><output id="t2v">0.40</output>
+      <span><i class="sw" style="background:var(--bad)"></i>красный выше</span><span></span><output id="t3v">0.40</output>
+    </div>
+    <p style="color:var(--muted);margin:8px 0 0">
+      Значения по умолчанию взяты из предварительной шкалы непрерывного комфорта EN 12299
+      (C<sub>Cy</sub> &lt;0,2 очень комфортно, 0,2–0,3 комфортно, 0,3–0,4 средне, &gt;0,4 менее комфортно).
+      Здесь без частотного взвешивания, поэтому показания завышены относительно нормы.
+      Боковая ось = ось X телефона. Автор: Ададуров А.С.
+    </p>
+  </details>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+/* Измеритель поперечных ускорений трамвая. Автор: Ададуров А.С. */
+(function(){
+  'use strict';
+  const $ = id => document.getElementById(id);
+
+  // ---------- карта ----------
+  const map = L.map('map', {zoomControl:false}).setView([56.852, 53.204], 13); // Ижевск по умолчанию
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  L.control.zoom({position:'topright'}).addTo(map);
+  const track = L.layerGroup().addTo(map);
+  let me = null, follow = true;
+  map.on('dragstart', () => follow = false);
+  $('btnCenter').onclick = () => { follow = true; if (lastFix) map.setView([lastFix.lat, lastFix.lon], Math.max(map.getZoom(), 16)); };
+
+  // ---------- пороги ----------
+  const thr = {t1:0.30, t2:0.40};
+  function readThr(){
+    thr.t1 = +$('t1').value; thr.t2 = Math.max(+$('t2').value, thr.t1 + 0.05);
+    $('t2').value = thr.t2.toFixed(2);
+    $('t1v').value = thr.t1.toFixed(2); $('t2v').value = thr.t2.toFixed(2); $('t3v').value = thr.t2.toFixed(2);
+    redraw();
+  }
+  $('t1').oninput = $('t2').oninput = readThr;
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  function zone(a){ return a < thr.t1 ? 0 : a < thr.t2 ? 1 : 2; }
+  function color(a){ return [css('--ok'), css('--warn'), css('--bad')][zone(a)]; }
+
+  // ---------- датчик ускорений ----------
+  // Буфер боковой составляющей (ось X телефона) за последнюю секунду.
+  // event.acceleration — ускорение без силы тяжести (вычислена ОС по датчикам).
+  const buf = [];          // {t, ax}
+  let peak = 0, nEv = 0, hzT0 = 0;
+  let gx = null; // медленная (гравитационная) составляющая по X для запасного режима
+  function onMotion(e){
+    let x;
+    if (e.acceleration && e.acceleration.x !== null) {
+      x = e.acceleration.x;
+    } else if (e.accelerationIncludingGravity && e.accelerationIncludingGravity.x !== null) {
+      // Запасной режим: фильтр первого порядка выделяет постоянную часть, её вычитаем
+      const raw = e.accelerationIncludingGravity.x;
+      gx = gx === null ? raw : gx + 0.02*(raw - gx);
+      x = raw - gx;
+    } else return;
+    const t = performance.now();
+    buf.push({t, ax:x});
+    while (buf.length && t - buf[0].t > 1000) buf.shift();
+    const ax = Math.abs(x);
+    if (ax > peak) peak = ax;
+    nEv++;
+    if (!hzT0) hzT0 = t;
+    if (t - hzT0 >= 2000){ $('hz').textContent = (nEv / ((t - hzT0)/1000)).toFixed(0); nEv = 0; hzT0 = t; }
+  }
+  function rms1s(){
+    if (!buf.length) return 0;
+    let s = 0; for (const b of buf) s += b.ax*b.ax;
+    return Math.sqrt(s / buf.length);
+  }
+
+  // ---------- геолокация ----------
+  let watchId = null, lastFix = null, uiTimer = null, wakeLock = null;
+  const points = [];       // {time, lat, lon, acc, speed, rms, peak}
+  function onFix(p){
+    const c = p.coords;
+    const rms = rms1s();
+    const rec = {time:new Date(p.timestamp).toISOString(), lat:c.latitude, lon:c.longitude,
+                 acc:c.accuracy, speed:c.speed, rms, peak};
+    peak = 0; // пик между фиксами
+    if (lastFix){
+      L.polyline([[lastFix.lat,lastFix.lon],[c.latitude,c.longitude]],
+                 {color:color(rms), weight:7, opacity:.9}).addTo(track).bindPopup(popupText(rec));
+    }
+    points.push(rec);
+    lastFix = {lat:c.latitude, lon:c.longitude};
+    if (!me) me = L.circleMarker([c.latitude,c.longitude],{radius:7,color:'#fff',fillColor:css('--accent'),fillOpacity:1}).addTo(map);
+    me.setLatLng([c.latitude,c.longitude]);
+    if (follow) map.setView([c.latitude,c.longitude], Math.max(map.getZoom(), 16));
+    $('spd').textContent = c.speed == null ? '—' : (c.speed*3.6).toFixed(0);
+    $('acc').textContent = c.accuracy.toFixed(0);
+    $('npts').textContent = points.length;
+    $('btnCsv').disabled = false;
+  }
+  function popupText(r){
+    return `СКЗ ${r.rms.toFixed(2)} м/с², пик ${r.peak.toFixed(2)} м/с²<br>${r.time.slice(11,19)} UTC, ±${r.acc.toFixed(0)} м`;
+  }
+  function redraw(){
+    track.clearLayers();
+    for (let i=1;i<points.length;i++){
+      const a=points[i-1], b=points[i];
+      L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:color(b.rms),weight:7,opacity:.9}).addTo(track).bindPopup(popupText(b));
+    }
+  }
+
+  // ---------- управление ----------
+  function status(s){ $('status').textContent = s; }
+  async function start(){
+    if (!('DeviceMotionEvent' in window)) { status('Браузер не даёт доступ к акселерометру.'); return; }
+    if (!navigator.geolocation) { status('Браузер не даёт доступ к геолокации.'); return; }
+    if (!window.isSecureContext) { status('Нужен защищённый контекст (https или локальный файл в Chrome).'); return; }
+    // Запрос разрешения (iOS и некоторые сборки Chrome). Отказ не фатален: пробуем слушать датчик всё равно.
+    if (typeof DeviceMotionEvent.requestPermission === 'function'){
+      try { await DeviceMotionEvent.requestPermission(); } catch(e){}
+    }
+    window.addEventListener('devicemotion', onMotion);
+    // Контроль: если за 3 с не пришло ни одного события — подсказываем, что включить.
+    setTimeout(() => {
+      if (watchId !== null && !buf.length)
+        status('Данные с акселерометра не приходят. Chrome → Настройки → Настройки сайтов → Датчики движения → включить. ' +
+               'Если не помогает, откройте файл по https (см. инструкцию).');
+    }, 3000);
+    watchId = navigator.geolocation.watchPosition(onFix,
+      err => status('Геолокация: ' + err.message),
+      {enableHighAccuracy:true, maximumAge:0, timeout:15000});
+    uiTimer = setInterval(() => {
+      const r = rms1s();
+      $('arms').textContent = r.toFixed(2);
+      $('apk').textContent = peak.toFixed(2);
+      $('dot').style.background = buf.length ? color(r) : css('--muted');
+    }, 200);
+    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+    $('btnStart').disabled = true; $('btnStop').disabled = false;
+    status('Запись идёт. Ждём первую точку ГНСС…');
+  }
+  function stop(){
+    window.removeEventListener('devicemotion', onMotion);
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    clearInterval(uiTimer); watchId = null;
+    if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+    $('btnStart').disabled = false; $('btnStop').disabled = true;
+    status(`Остановлено. Записано точек: ${points.length}.`);
+  }
+  function clearAll(){
+    if (watchId !== null) stop();
+    points.length = 0; lastFix = null; track.clearLayers(); peak = 0; buf.length = 0;
+    $('npts').textContent = 0; $('btnCsv').disabled = true; status('Очищено.');
+  }
+  function csv(){
+    const rows = [['time_utc','lat','lon','accuracy_m','speed_mps','lat_acc_rms_1s_mps2','lat_acc_peak_mps2','zone']];
+    for (const r of points) rows.push([r.time, r.lat.toFixed(6), r.lon.toFixed(6), r.acc.toFixed(1),
+      r.speed==null?'':r.speed.toFixed(2), r.rms.toFixed(3), r.peak.toFixed(3), ['green','yellow','red'][zone(r.rms)]]);
+    const blob = new Blob(['# Автор: Ададуров А.С.\n' + rows.map(r=>r.join(',')).join('\n')], {type:'text/csv'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'tram_lateral_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  $('btnStart').onclick = start; $('btnStop').onclick = stop; $('btnClear').onclick = clearAll; $('btnCsv').onclick = csv;
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && watchId !== null && navigator.wakeLock)
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+  });
+  readThr();
+})();
+</script>
+</body>
+</html>
